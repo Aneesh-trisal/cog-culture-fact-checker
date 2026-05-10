@@ -3,7 +3,7 @@ import re
 import spacy
 from pypdf import PdfReader
 from docx import Document
-from duckduckgo_search import DDGS   # ← Changed from ddgs
+from duckduckgo_search import DDGS
 import time
 from typing import List, Dict
 import pandas as pd
@@ -11,21 +11,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import sys
 
-# Load spaCy model (improved for cloud)
+
+# Load spaCy model (needed for entity recognition and sentence splitting)
 @st.cache_resource
 def load_nlp():
     try:
         return spacy.load("en_core_web_sm")
     except OSError:
-        st.warning("Downloading spaCy model... (only first time)")
+        st.warning("Downloading spaCy model... (only happens the first time)")
         subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
         return spacy.load("en_core_web_sm")
+
 
 nlp = load_nlp()
 
 
-# ========================== 1. CLEAN TEXT ==========================
 def clean_text(text: str) -> str:
+    """Clean up text by removing hyphen breaks and extra whitespace."""
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'\n+', '\n', text)
@@ -33,8 +35,10 @@ def clean_text(text: str) -> str:
 
 
 def load_document(uploaded_file) -> str:
+    """Load text from uploaded PDF or DOCX file."""
     if not uploaded_file:
         return ""
+    
     text = ""
     if uploaded_file.name.endswith(".pdf"):
         reader = PdfReader(uploaded_file)
@@ -47,21 +51,22 @@ def load_document(uploaded_file) -> str:
         for para in doc.paragraphs:
             if para.text.strip():
                 text += para.text + "\n"
+    
     return clean_text(text)
 
 
-# ========================== 2. CLAIM EXTRACTION (spaCy NER) ==========================
 def extract_claims(text: str) -> List[str]:
+    """Extract potential factual claims using spaCy sentence segmentation."""
     if not text:
         return []
-
+    
     doc = nlp(text)
     claims = []
-
+    
     for sent in doc.sents:
         s = sent.text.strip()
-
-        # Basic filters
+        
+        # Skip very short/long sentences, titles, and obvious non-claims
         if len(s) < 15 or len(s) > 800:
             continue
         if s.isupper():
@@ -70,8 +75,8 @@ def extract_claims(text: str) -> List[str]:
             continue
         if s.endswith(":"):
             continue
-
-        # Accept if: has a named entity, has a number, or has a factual keyword
+        
+        # Keep sentence if it has entities, numbers, or factual keywords
         has_entity = len(sent.ents) > 0
         has_number = any(tok.like_num for tok in sent) or bool(re.search(r'\d', s)) or '%' in s or '$' in s
         has_fact_word = any(w in s.lower() for w in [
@@ -80,18 +85,18 @@ def extract_claims(text: str) -> List[str]:
             "serves as", "elected", "appointed", "founded", "known as",
             "prime minister", "president", "capital", "billion", "trillion", "million"
         ])
-
+        
         if has_entity or has_number or has_fact_word:
             claims.append(s)
-
+    
     return claims
 
 
-# ========================== 3. WEB SEARCH (with retry) ==========================
 def search_web(claim: str) -> List[Dict]:
+    """Search the web for information about a claim (with retry logic)."""
     all_results = []
-    queries = [claim[:130], claim.split(".")[0][:100]]  # two different angle queries
-
+    queries = [claim[:130], claim.split(".")[0][:100]]
+    
     for q in queries:
         for attempt in range(3):
             try:
@@ -102,7 +107,8 @@ def search_web(claim: str) -> List[Dict]:
                 break
             except Exception:
                 time.sleep(1.5 * (attempt + 1))
-
+    
+    # Remove duplicate URLs
     seen = set()
     unique = []
     for r in all_results:
@@ -110,11 +116,12 @@ def search_web(claim: str) -> List[Dict]:
         if url and url not in seen:
             seen.add(url)
             unique.append(r)
+    
     return unique[:12]
 
 
-# ========================== 4. GROUP CLASSIFICATION ==========================
 def categorize_claim(claim: str) -> str:
+    """Categorize the claim into different types for better organization."""
     s = claim.lower()
     if any(x in s for x in ["market", "billion", "trillion", "size", "projected to reach"]):
         return "Market Projection"
@@ -131,49 +138,46 @@ def categorize_claim(claim: str) -> str:
     return "General Claim"
 
 
-# ========================== 5. EXTRACT REAL FACT FROM RESULTS ==========================
 def extract_real_fact(claim: str, search_results: List[Dict]) -> str:
+    """Try to find the most relevant correcting or supporting information from search results."""
     claim_keywords = set(re.findall(r'\b\w{4,}\b', claim.lower()))
     claim_numbers = re.findall(r'\d+\.?\d*', claim)
-
+    
     best_snippet = ""
     best_score = 0
-
+    
     for r in search_results:
         title = r.get("title", "")
         body = r.get("body", "") or ""
         combined = (title + " " + body).lower()
-
+        
         snippet_words = set(re.findall(r'\b\w{4,}\b', combined))
         overlap = len(claim_keywords & snippet_words)
-
+        
         snippet_numbers = re.findall(r'\d+\.?\d*', combined)
-        has_different_number = any(n not in claim_numbers for n in snippet_numbers)
-        if has_different_number:
+        if any(n not in claim_numbers for n in snippet_numbers):
             overlap += 2
-
+        
         if overlap > best_score:
             best_score = overlap
             snippet = body[:220].strip()
             if snippet:
                 best_snippet = f'"{snippet}..." — {r.get("href", "")}'
-
+    
     return best_snippet if best_snippet else "No correcting source found."
 
 
-# ========================== 6. VERIFICATION LOGIC ==========================
 def classify_claim(claim: str, search_results: List[Dict]) -> tuple:
+    """Analyze search results and decide if the claim is Verified, Inaccurate, or Unverified."""
     if not search_results:
         return "False", "No relevant web results found", "No web results found for this claim."
-
+    
     positive = 0
     negative = 0
     outdated = 0
     domains = set()
-
     claim_numbers = re.findall(r'\d+\.?\d*', claim)
-
-    # ---- FIXED: removed short common phrases that cause false positives ----
+    
     conf_words = {
         "according to", "official", "confirmed", "verified", "statista", "idc",
         "mckinsey", "gartner", "report", "study shows", "research shows", "industry reports"
@@ -184,55 +188,44 @@ def classify_claim(claim: str, search_results: List[Dict]) -> tuple:
         "fact-checked", "inaccurate claim", "disinformation", "not accurate"
     }
     outdated_words = {"outdated", "no longer", "old data", "previously", "was true until"}
-
-    # spaCy NER on the claim for entity-level matching
+    
+    # Get entities from the claim for better matching
     claim_doc = nlp(claim)
     claim_entities = [e.text.lower() for e in claim_doc.ents]
-
+    
     for r in search_results:
         text = (r.get("title", "") + " " + r.get("body", "")).lower()
         url = r.get("href", "").lower()
-
+        
         try:
             domain = url.split("/")[2]
             domains.add(domain)
         except Exception:
             pass
-
-        # Contra words — only fire on strong, specific phrases now
+        
         if any(w in text for w in contra_words):
             negative += 1
-
-        # Confirmation signals
         if any(w in text for w in conf_words):
             positive += 2 if any(rep in url for rep in ["statista", "idc", "mckinsey", "gartner", ".gov"]) else 1
-
-        # Outdated signals
         if any(w in text for w in outdated_words):
             outdated += 1
-
-        # Authoritative domain bonus
         if any(x in url for x in [".gov", ".edu", "who.int", "un.org", "bbc.com", "reuters.com", "apnews.com"]):
             positive += 2
-
-        # Number match bonus
         if claim_numbers:
             for num in claim_numbers:
                 if num in text:
                     positive += 2
-
-        # ---- NEW: NER entity match bonus ----
         for ent in claim_entities:
             if ent in text:
                 positive += 2
-
+    
     unique_sources = len(domains)
     total_positive = positive
-
-    # Verdict logic
+    
+    # Final verdict logic
     if unique_sources == 0:
         return "False", "No supporting evidence found in web results", "No web results found."
-
+    
     if negative >= 4 or (negative >= 3 and total_positive <= 4):
         verdict = "Inaccurate (real but outdated data)"
         reason = "Claim contradicted by specific fact-check sources"
@@ -254,18 +247,18 @@ def classify_claim(claim: str, search_results: List[Dict]) -> tuple:
     else:
         verdict = "Unverified"
         reason = f"Insufficient consensus ({unique_sources} sources)"
-
+    
     real_fact = extract_real_fact(claim, search_results) if verdict != "Verified" else "—"
     return verdict, reason, real_fact
 
 
-# ========================== 7. PARALLEL PROCESSING ==========================
 def process_all_claims(claims: List[str]) -> List[Dict]:
+    """Process all claims in parallel with progress tracking."""
     results = []
     progress_bar = st.progress(0)
     status_placeholder = st.empty()
     total = len(claims)
-
+    
     def process_claim(claim: str):
         search_results = search_web(claim)
         verdict, reason, real_fact = classify_claim(claim, search_results)
@@ -279,28 +272,28 @@ def process_all_claims(claims: List[str]) -> List[Dict]:
             "sources_found": len(search_results),
             "raw_results": search_results[:4]
         }
-
+    
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_idx = {executor.submit(process_claim, c): i for i, c in enumerate(claims)}
-
+        
         for idx, future in enumerate(as_completed(future_to_idx), 1):
             result = future.result()
             results.append(result)
             progress = idx / total
             progress_bar.progress(progress)
             status_placeholder.caption(f"✅ Processed {idx}/{total} claims • {progress:.0%}")
-
+    
     status_placeholder.empty()
     return sorted(results, key=lambda x: claims.index(x["claim"]))
 
 
-# ========================== 8. SHOW SUMMARY ==========================
 def show_summary(results: List[Dict], start_time: float):
+    """Display summary metrics and detailed results table."""
     if not results:
         return
-
+    
     elapsed = time.time() - start_time
-
+    
     df = pd.DataFrame([{
         "Claim": r["claim"][:280] + "..." if len(r["claim"]) > 280 else r["claim"],
         "Category": r["category"],
@@ -309,13 +302,13 @@ def show_summary(results: List[Dict], start_time: float):
         "Real Fact / Correction": r["real_fact"],
         "Sources": r["sources_found"]
     } for r in results])
-
+    
     total = len(results)
     verified = sum(1 for r in results if r["verdict"] == "Verified")
     inaccurate = sum(1 for r in results if "Inaccurate" in r["verdict"])
     false_count = sum(1 for r in results if r["verdict"] == "False")
     unverified = total - verified - inaccurate - false_count
-
+    
     st.subheader("📊 Fact Check Overview")
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Total Claims", total)
@@ -324,14 +317,15 @@ def show_summary(results: List[Dict], start_time: float):
     col4.metric("False ❌", false_count)
     col5.metric("Unverified ❓", unverified)
     col6.metric("Processing Time", f"{elapsed:.1f} sec")
-
+    
+    # Grouped summary
     st.markdown("<h3 style='text-align: center;'>📊 Grouped Summary</h3>", unsafe_allow_html=True)
     grouped = df.groupby(["Category", "Verdict"]).size().unstack(fill_value=0)
     grouped = grouped.reset_index()
     st.dataframe(grouped, use_container_width=True, hide_index=True)
-
+    
     st.markdown("<h3 style='text-align: center;'>Fact-Check Results</h3>", unsafe_allow_html=True)
-
+    
     def color_verdict_text(val):
         if val == "Verified":
             return 'color: #28a745; font-weight: bold;'
@@ -342,41 +336,44 @@ def show_summary(results: List[Dict], start_time: float):
         elif val == "Unverified":
             return 'color: #6c757d; font-weight: bold;'
         return ''
-
+    
     styled_df = df.style.map(color_verdict_text, subset=['Verdict'])
     st.dataframe(styled_df, use_container_width=True, hide_index=True)
-
+    
     csv = df.to_csv(index=False)
-    st.download_button("Download Full Report as CSV", csv, file_name="fact_check_report.csv", mime="text/csv", use_container_width=True)
+    st.download_button("Download Full Report as CSV", csv, 
+                      file_name="fact_check_report.csv", 
+                      mime="text/csv", 
+                      use_container_width=True)
 
 
-# ========================== MAIN APP ==========================
 def main():
     st.set_page_config(page_title="Cog Culture Fact Checker", page_icon="🔎", layout="wide")
     st.title("Cog Culture Fact Checker")
     st.caption("PDF/DOCX + Raw Text | spaCy NER | Parallel Processing")
-
+    
     col_left, col_right = st.columns([1, 2])
-
+    
     uploaded_file = None
     raw_text = ""
-
+    
     with col_left:
         st.subheader("📤 Input Source")
-
         tab_file, tab_text = st.tabs(["📄 Upload File (PDF/DOCX)", "✍️ Paste Raw Text"])
-
+        
         with tab_file:
-            uploaded_file = st.file_uploader("Choose PDF or DOCX file", type=["pdf", "docx"], key="file_uploader")
-
+            uploaded_file = st.file_uploader("Choose PDF or DOCX file", 
+                                           type=["pdf", "docx"], 
+                                           key="file_uploader")
+        
         with tab_text:
             raw_text = st.text_area("Paste your raw text / paragraphs here",
                                     height=300,
                                     placeholder="Enter claims or full text here for quick testing...",
                                     key="raw_text_area")
-
+        
         run_clicked = st.button("🚀 Start Fact Checking", type="primary", use_container_width=True)
-
+    
     with col_right:
         st.subheader("📋 Extracted Claims Preview")
         preview_claims = []
@@ -384,19 +381,19 @@ def main():
             preview_claims = extract_claims(clean_text(st.session_state.raw_text_area))
         elif uploaded_file is not None:
             preview_claims = extract_claims(load_document(uploaded_file))
-
+        
         if preview_claims:
             for i, claim in enumerate(preview_claims):
                 st.write(f"**{i+1}.** {claim}")
             st.caption(f"**Total claims: {len(preview_claims)}**")
         else:
             st.info("Paste text in the left tab or upload a file to preview claims.")
-
+    
     st.divider()
-
+    
     if run_clicked:
         start_time = time.time()
-
+        
         if raw_text and raw_text.strip():
             text = clean_text(raw_text)
             source = "Raw Text"
@@ -407,15 +404,15 @@ def main():
         else:
             st.warning("Please either paste text or upload a file.")
             st.stop()
-
+        
         with st.spinner("Extracting claims..."):
             claims = extract_claims(text)
-
+        
         st.success(f"Extracted {len(claims)} claims from {source} — Starting parallel verification...")
-
+        
         results = process_all_claims(claims)
         show_summary(results, start_time)
-
+        
         st.subheader("🔍 Detailed Search Results")
         for i, res in enumerate(results):
             if res["raw_results"]:
@@ -428,7 +425,7 @@ def main():
                         st.write(item.get('href', ''))
                         st.caption((item.get('body', '') or '')[:300] + "...")
                         st.divider()
-
+    
     st.divider()
     st.caption("Modular • Transparent • spaCy NER • Fast Parallel Processing • Trap Document Ready")
 
